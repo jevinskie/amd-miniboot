@@ -1,163 +1,124 @@
-/* rtl8139-stage0/net_tiny.c : ARP + minimal UDP/TFTP */
-#include "net_tiny.h"
+/* rtl8139-stage0/rtl8139_fifo.c : polled FIFO-only RTL8139 */
+#include <stddef.h>
 #include "rtl8139_fifo.h"
+#include "ecam.h"
+
+#define VIRT(addr) ((volatile uint8_t *)((uintptr_t)mm + (addr)))
+
+/* --- registers --- */
+#define IDR0    0x00
+#define CR      0x37
+#define IMR     0x3C
+#define ISR     0x3E
+#define RCR     0x44
+#define CAPR    0x38
+#define TPSR    0x20
+#define TCR     0x40
+
+/* CR bits */
+#define CR_RESET (1<<4)
+#define CR_RE    (1<<3)
+#define CR_TE    (1<<2)
+
+/* RCR bits */
+#define RCR_AB   (1<<4)
+#define RCR_AM   (1<<3)
+#define RCR_APM  (1<<7)
+
+/* FIFO size */
+#define RX_FIFO_SIZE (64*1024)
+
+static volatile uint8_t *mm;         /* BAR1 virtual base */
+
+static int mem_eq(const void *a, const void *b, size_t n) {
+    const uint8_t *x = a, *y = b;
+    while (n--) if (*x++ != *y++) return 0;
+    return 1;
+}
 
 #define htons(x) __builtin_bswap16(x)
+#define ntohs(x) __builtin_bswap16(x)
 #define htonl(x) __builtin_bswap32(x)
+#define ntohl(x) __builtin_bswap32(x)
 
-/* ---- compile-time constants (works with qemu-usernet) ---- */
-static const uint8_t srv_ip[4]  = {10,0,2,2};
-static const uint8_t cli_ip[4]  = {10,0,2,15};
-static       uint8_t cli_mac[6];
-static       uint8_t srv_mac[6];
 
-static uint16_t udp_port = 50000;   /* arbitrary src port */
-static uint16_t tftp_sport;
-
-/* ---- checksum helpers ---- */
-static uint16_t csum16(const void *buf, uint32_t len, uint32_t sum)
+/* ---------- tiny memcpy (no libc) ---------- */
+static void mem_cpy(void *dst, const void *src, uint16_t n)
 {
-    const uint16_t *p = buf;
-    while (len > 1) { sum += *p++; len -= 2; }
-    if (len) sum += *(uint8_t *)p;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return ~sum;
+    uint8_t *d = dst; const uint8_t *s = src;
+    while (n--) *d++ = *s++;
 }
 
-/* ---- tiny memcpy/memset ---- */
-static void mem_cpy(void *d,const void *s,uint32_t n)
-{ uint8_t *D=d; const uint8_t *S=s; while(n--) *D++=*S++; }
-
-static void mem_set(void *d,uint8_t v,uint32_t n)
-{ uint8_t *D=d; while(n--) *D++=v; }
-
-/* ---- Ethernet frame tx helper ---- */
-static int eth_send(const uint8_t *dst_mac,uint16_t ethertype,
-                    const void *payload,uint16_t len)
+/* ---------- probe & init ---------- */
+int rtl8139_init(uint32_t *bar_out, uint8_t mac[6])
 {
-    uint8_t frame[1518];
-    mem_cpy(frame,dst_mac,6);
-    mem_cpy(frame+6,cli_mac,6);
-    *(uint16_t *)(frame+12) = htons(ethertype);
-    mem_cpy(frame+14,payload,len);
-    return rtl8139_send(frame,len+14);
-}
+    for (uint8_t bus=0; bus<1; ++bus)
+        for (uint8_t dev=0; dev<32; ++dev) {
+            uint32_t id = ecam_r32(bus,dev,0,0x00);
+            if (id == 0x813910EC) {              /* 10EC:8139 */
+                uint32_t bar1 = ecam_r32(bus,dev,0,0x14);
+                ecam_w32(bus,dev,0,0x04,
+                         ecam_r32(bus,dev,0,0x04) | 2); /* MEM enable */
 
-/* ---- ARP ---- */
-struct arp_pkt {
-    uint16_t htype, ptype;
-    uint8_t  hlen, plen;
-    uint16_t oper;
-    uint8_t  sha[6]; uint8_t spa[4];
-    uint8_t  tha[6]; uint8_t tpa[4];
-} __attribute__((packed));
+                *bar_out = bar1 & ~0xF;
+                mm = (volatile uint8_t *)(uintptr_t)(*bar_out);
 
-static int arp_resolve(void)
-{
-    struct arp_pkt req;
-    req.htype = htons(1); req.ptype = htons(0x0800);
-    req.hlen  = 6; req.plen = 4; req.oper = htons(1);
-    mem_cpy(req.sha, cli_mac,6); mem_cpy(req.spa, cli_ip,4);
-    mem_set(req.tha,0,6);        mem_cpy(req.tpa, srv_ip,4);
+                /* Soft reset */
+                VIRT(CR)[0] = CR_RESET;
+                while (VIRT(CR)[0] & CR_RESET) ;
 
-    uint8_t bcast[6]; mem_set(bcast,0xFF,6);
-    eth_send(bcast,0x0806,&req,sizeof(req));
+                /* fetch MAC */
+                for (int i=0;i<6;i++) mac[i] = VIRT(IDR0)[i];
 
-    /* poll up to ~1 s */
-    uint8_t buf[1600]; uint16_t len;
-    for (uint32_t i=0;i<1000000;i++) {
-        if (rtl8139_read(buf,&len)) {
-            if (len>=42 && *(uint16_t *)(buf+12)==htons(0x0806)) {
-                struct arp_pkt *p=(void*)(buf+14);
-                if (p->oper==htons(2) && !__builtin_memcmp(p->spa,srv_ip,4)) {
-                    mem_cpy(srv_mac,p->sha,6);
-                    return 0;
-                }
+                /* Rx config */
+                *(volatile uint32_t *)VIRT(RCR) =
+                    RCR_AB | RCR_AM | RCR_APM;
+
+                /* Clear ints */
+                *(volatile uint16_t *)VIRT(IMR) = 0;
+                *(volatile uint16_t *)VIRT(ISR) = 0xFFFF;
+
+                /* Enable Rx/Tx */
+                VIRT(CR)[0] |= CR_RE;
+                return 0;
             }
         }
-    }
     return -1;
 }
 
-/* ---- UDP send ---- */
-static int udp_send(uint16_t sport,uint16_t dport,
-                    const void *data,uint16_t len)
+/* ---------- read one frame ---------- */
+int rtl8139_read(uint8_t *dst, uint16_t *len_out)
 {
-    uint8_t pkt[1500]; uint16_t iplen = 20+8+len;
-    /* IPv4 header */
-    mem_set(pkt,0,20);
-    pkt[0]=0x45; pkt[8]=64;
-    *(uint16_t*)(pkt+2)=htons(iplen);
-    *(uint16_t*)(pkt+10)=csum16(pkt,20,0);
-    mem_cpy(pkt+12,cli_ip,4); mem_cpy(pkt+16,srv_ip,4);
-    /* UDP */
-    uint8_t *udp=pkt+20;
-    *(uint16_t*)(udp+0)=htons(sport);
-    *(uint16_t*)(udp+2)=htons(dport);
-    *(uint16_t*)(udp+4)=htons(8+len);
-    mem_cpy(udp+8,data,len);
-    /* pseudo-header checksum */
-    uint32_t sum=0;
-    sum+= (cli_ip[0]<<8)|cli_ip[1]; sum+= (cli_ip[2]<<8)|cli_ip[3];
-    sum+= (srv_ip[0]<<8)|srv_ip[1]; sum+= (srv_ip[2]<<8)|srv_ip[3];
-    sum+= htons(17); sum+= htons(8+len);
-    *(uint16_t*)(udp+6)=csum16(udp,8+len,sum);
-    return eth_send(srv_mac,0x0800,pkt,20+8+len);
+    uint16_t isr = *(volatile uint16_t *)VIRT(ISR);
+    if (!(isr & 0x01)) return 0;               /* no ROK */
+
+    static uint16_t rx_off = 0;                /* CAPR pointer */
+
+    uint16_t status = *(volatile uint16_t *)(mm + rx_off);
+    uint16_t len    = *(volatile uint16_t *)(mm + rx_off + 2);
+    uint16_t ptr    = rx_off + 4;
+
+    for (uint16_t i=0;i<len;i++,ptr++)
+        dst[i] = *(volatile uint8_t *)(mm + (ptr & (RX_FIFO_SIZE-1)));
+
+    rx_off = (ptr + 3) & ~3;                   /* DWORD align */
+    *(volatile uint16_t *)VIRT(CAPR) = rx_off - 0x10;
+    *(volatile uint16_t *)VIRT(ISR)  = 0x01;
+
+    (void)status;
+    *len_out = len;
+    return 1;
 }
 
-/* ---- net_init ---- */
-void net_init(const uint8_t mac[6])
-{ mem_cpy(cli_mac,mac,6); }
-
-/* ---- RFC1350 TFTP download ---- */
-static int tftp_rrq(const char *fname)
+/* ---------- send (≤ 1514 B) via Tx FIFO window ---------- */
+int rtl8139_send(const uint8_t *pkt, uint16_t len)
 {
-    char buf[2+128];
-    uint16_t l=0;
-    buf[l++]=0; buf[l++]=1;            /* RRQ */
-    while(*fname) buf[l++]=*fname++;
-    buf[l++]=0;
-    const char mode[]="octet";
-    for(int i=0;i<6;i++) buf[l++]=mode[i];
-    buf[l++]=0;
-    return udp_send(udp_port,69,buf,l);
-}
-
-int tftp_fetch(const char *fname,uint8_t *dst,uint32_t max_len)
-{
-    if (arp_resolve()) return -1;
-    if (tftp_rrq(fname)) return -1;
-
-    uint8_t frame[1600]; uint16_t flen;
-    uint32_t off=0;
-
-    while (1) {
-        while(!rtl8139_read(frame,&flen)) ;
-
-        /* verify IPv4/UDP */
-        if (flen<42 || *(uint16_t*)(frame+12)!=htons(0x0800))
-            continue;
-        uint8_t *ip=frame+14;
-        uint8_t *udp=ip+20;
-        uint16_t sport = ntohs(*(uint16_t*)udp);
-        uint16_t dport = ntohs(*(uint16_t*)(udp+2));
-        if (dport!=udp_port) continue;
-
-        uint8_t *tp=udp+8;
-        uint16_t opcode = ntohs(*(uint16_t*)tp);
-        if (opcode==3) {                      /* DATA */
-            uint16_t blk = ntohs(*(uint16_t*)(tp+2));
-            uint16_t dlen = flen-14-20-8-4;
-            if (off+dlen>max_len) return -2;
-            mem_cpy(dst+off,tp+4,dlen); off+=dlen;
-            /* ACK */
-            uint8_t ack[4]={0,4,(blk>>8)&0xFF,blk&0xFF};
-            udp_send(udp_port,sport,ack,4);
-            if (dlen<512) break;              /* last block */
-        } else if (opcode==5) {               /* ERROR */
-            return -3;
-        } else if (opcode==4) continue;       /* ACK -> ignore */
-        if (!tftp_sport) tftp_sport=sport;
-    }
+    if (len > 1514) return -1;
+    /* Tx FIFO window 0x20-0x3F (32 dwords) */
+    mem_cpy(VIRT(TPSR), pkt, len);
+    *(volatile uint16_t *)VIRT(TCR) = len;
+    /* Wait transmit complete (TR_OK in ISR bit 2) */
+    while (!(*(volatile uint16_t *)VIRT(ISR) & (1<<2))) ;
+    *(volatile uint16_t *)VIRT(ISR) = (1<<2);
     return 0;
 }

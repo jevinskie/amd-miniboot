@@ -1,4 +1,3 @@
-# rtl8139-stage0/Makefile
 CROSS  ?= x86_64-unknown-linux-gnu-
 CC      = $(CROSS)gcc
 LD      = $(CROSS)ld
@@ -22,4 +21,3 @@ stage0.bin: $(OBJS) linker.ld
 
 clean:
 	rm -f *.o *.elf stage0.bin
-
